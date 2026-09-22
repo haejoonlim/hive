@@ -343,6 +343,9 @@ def cmd_watch(fb, interval):
             for t in fb.open_threads():
                 tid = t["id"]
                 title = t.get("title", "")
+                # HEAD 탭(사람-지휘자 대화)은 자동 깨우기 금지 — 무의미한 토큰 소모 방지
+                if is_head(title):
+                    continue
                 state = turn_state(fb, tid)
                 if state == "running":
                     cooldown.pop(tid, None)
@@ -366,6 +369,14 @@ def cmd_watch(fb, interval):
                                     print(f"[{ts()}] {title}: ▶ 인박스 확인 전송 (새 지시 감지)", flush=True)
                                     continue
                 # 2) 공통: idle 컨티뉴
+                # 마지막 어시스턴트 답변이 '대기'면 할 일 없다는 뜻 — 새 지시 감지 전까지 깨우지 않음
+                last_a = None
+                for m in reversed(msgs):
+                    if m.get("role") == "assistant":
+                        last_a = m
+                        break
+                if last_a is not None and msg_text(last_a).strip() == "대기":
+                    continue
                 if now - cooldown.get(tid, 0) < IDLE_COOLDOWN:
                     continue
                 r = fb.send(tid, CONTINUE_TEXT)
