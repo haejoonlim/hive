@@ -31,6 +31,8 @@ launchId는 오케스트레이터 프로세스 환경변수(FREEBUFF_LAUNCH_ID)�
 import json
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -317,12 +319,151 @@ def cmd_stats(fb):
     return 0
 
 
+# ---------------------------------------------------------------- brain (로컬 결정 엔진 — 옵트인)
+
+BRAIN_PORT = int(os.environ.get("HIVE_BRAIN_PORT", "8777"))
+BRAIN_PID_FILE = os.path.expanduser("~/.hive-brain.pid")
+BRAIN_MODEL_PATH = os.path.expanduser("~/hive-models/MiniCPM5-2B-Q4_K_M.gguf")
+
+
+def brain_status():
+    """(실행중?, pid, 비고) — pid 파일 기반 llama-server 확인."""
+    try:
+        with open(BRAIN_PID_FILE) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return True, pid, "llama-server 실행 중"
+    except (FileNotFoundError, ProcessLookupError, ValueError, PermissionError):
+        return False, None, "미실행 — fallback 휴리스틱 전용 (RAM 0)"
+
+
+def brain_on(model=None, threads=3):
+    """로컬 결정 서버 수동 기동. RAM 1.5~2.5GB 상주 — 명시적 옵트인만."""
+    running, pid, _ = brain_status()
+    if running:
+        print(f"이미 실행 중 (pid {pid}).")
+        return 0
+    model = model or os.environ.get("HIVE_BRAIN_MODEL", os.path.expanduser("~/hive-models/MiniCPM5-2B-Q4_K_M.gguf"))
+    if not shutil.which("llama-server"):
+        print("llama-server 없음. 설치: brew install llama.cpp")
+        return 1
+    if not os.path.exists(model):
+        print(f"모델 없음: {model}")
+        print("다운로드: curl -L -o ~/hive-models/MiniCPM5-2B-Q4_K_M.gguf \\")
+        print("  https://huggingface.co/bartowski/MiniCPM5-2B-GGUF/resolve/main/MiniCPM5-2B-Q4_K_M.gguf")
+        return 1
+    print("⚠️ RAM 1.5~2.5GB 상주 시작. 끄려면: hive brain off")
+    proc = subprocess.Popen(
+        ["llama-server", "-m", model, "--host", "127.0.0.1", "--port", str(BRAIN_PORT),
+         "-c", "2048", "-t", str(threads)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with open(BRAIN_PID_FILE, "w") as f:
+        f.write(str(proc.pid))
+    for _ in range(60):
+        time.sleep(1)
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{BRAIN_PORT}/health", timeout=2) as r:
+                if r.status == 200:
+                    print(f"[{ts()}] 브레인 기동 완료 (port {BRAIN_PORT}, pid {proc.pid})")
+                    return 0
+        except Exception:
+            pass
+    print("헬스체크 실패 — 로그 확인 요망")
+    return 1
+
+
+def brain_off():
+    running, pid, _ = brain_status()
+    if running:
+        os.kill(pid, signal.SIGTERM)
+        print(f"브레인 종료 (pid {pid}). RAM 반환.")
+    try:
+        os.remove(BRAIN_PID_FILE)
+    except FileNotFoundError:
+        pass
+    return 0
+
+
+def brain_decide(state, question, options):
+    """로컬 모델에 결정 질의. options: [(id, desc)]. 반환: {id, prob} 또는 None."""
+    body = {
+        "prompt": (
+            "You are a decision engine. Apply the criterion to the evidence. "
+            "Answer with exactly one option letter, nothing else.\n\n"
+            f"EVIDENCE: {state}\n\nCRITERION: {question}\n"
+            + "\n".join(f"  {chr(65+i)}. {d}" for i, (_, d) in enumerate(options))
+            + "\n\nANSWER LETTER:"
+        ),
+        "n_predict": 1, "temperature": 0.0, "n_probs": 24, "cache_prompt": True,
+    }
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{BRAIN_PORT}/completion",
+        data=json.dumps(body).encode(), method="POST",
+        headers={"content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        d = json.loads(r.read().decode())
+    probs = (d.get("completion_probabilities") or [{}])[0].get("probs") or []
+    # 옵션 글자 토큰의 확률만 모아 정규화 (상위 토큰에 없는 글자는 확률 0 취급)
+    letter_probs = {}
+    for p in probs:
+        tok = (p.get("tok_str") or p.get("tok", "")).strip()
+        if tok in [chr(65 + i) for i in range(len(options))]:
+            letter_probs[tok] = max(letter_probs.get(tok, 0.0), p.get("prob", 0.0))
+    if not letter_probs:
+        return None
+    total = sum(letter_probs.values())
+    best = max(letter_probs, key=letter_probs.get)
+    idx = ord(best) - 65
+    return {"id": options[idx][0], "prob": letter_probs[best] / total if total else 0.0}
+
+
+def decide(state, question, options):
+    """결정 제공자: local(실행 중이면) → fallback(항상). 반환 (winner_id, prob, backend)."""
+    running, _, _ = brain_status()
+    if running:
+        try:
+            r = brain_decide(state, question, options)
+            if r:
+                return r["id"], r["prob"], "local"
+        except Exception:
+            pass
+    return None, 0.0, "fallback"
+
+
+def cmd_brain(fb, rest):
+    if not rest or rest[0] == "status":
+        running, pid, note = brain_status()
+        print(f"브레인: {'실행 중' if running else '꺼짐'} ({note})")
+        print("정책: fallback 휴리스틱이 기본. RAM 걱정 시 끄지 않아도 됨 — 미실행 시 RAM 0.")
+        return 0
+    if rest[0] == "on":
+        return brain_on()
+    if rest[0] == "off":
+        return brain_off()
+    print(__doc__)
+    return 1
+
+
+def cmd_decide_test(fb, state, question, opts):
+    opts_list = [(o.strip(), o.strip()) for o in opts.split(",")]
+    winner, prob, backend = decide(state, question, opts_list)
+    print(f"백엔드: {backend}")
+    if winner:
+        print(f"결정: {winner} ({prob:.2f})")
+    else:
+        print("로컬 브레인 미실행 — fallback 휴리스틱만 사용 중. 켜려면: hive brain on")
+    return 0
+
+
 # ---------------------------------------------------------------- watch (통합 루프)
 
 def cmd_watch(fb, interval):
     print(f"watch 시작 (interval={interval}s). Freebuff 앱 대기 중에도 유지.", flush=True)
     cooldown = {}
     inbox_ping_cooldown = {}
+    stuck_note = {}      # 마지막 어시스턴트 텍스트 → 반복 감지
+    stuck_log_at = {}    # 스킵 로그 스팸 방지
+    rotate_log_at = {}   # rotate 제안 로그 스팸 방지 (6시간)
     app_wait = False
     while True:
         try:
@@ -368,17 +509,24 @@ def cmd_watch(fb, interval):
                                     inbox_ping_cooldown[tid] = now
                                     print(f"[{ts()}] {title}: ▶ 인박스 확인 전송 (새 지시 감지)", flush=True)
                                     continue
-                # 2) 공통: idle 컨티뉴
-                # 마지막 어시스턴트 답변이 '대기'면 할 일 없다는 뜻 — 새 지시 감지 전까지 깨우지 않음
-                last_a = None
-                for m in reversed(msgs):
-                    if m.get("role") == "assistant":
-                        last_a = m
-                        break
-                if last_a is not None and msg_text(last_a).strip() == "대기":
+                # 2) 공통: idle 컨티뉴 — Smart Watch 휴리스틱 (결정론, RAM 0)
+                a_texts = [msg_text(m).strip() for m in msgs if m.get("role") == "assistant"]
+                if a_texts and a_texts[-1] == "대기":
+                    continue  # 할 일 없다고 명시한 워커 — 새 지시 감지 전까지 깨우지 않음
+                # 반복 정체(루프) 감지: 직전 두 어시스턴트 텍스트 동일 → 깨우지 않음
+                if len(a_texts) >= 2 and a_texts[-1] == a_texts[-2] and a_texts[-1] not in ("", "대기"):
+                    if now - stuck_log_at.get(tid, 0) > 1800:
+                        print(f"[{ts()}] {title}: ◇ 반복 정체 감지 — 스킵 (동일 응답 2회 연속)", flush=True)
+                        stuck_log_at[tid] = now
                     continue
+                # rotate 후보 감지: 컨텍스트 적체 (결정만 기록, 실행은 v0.5 rotate)
+                tok, _turns = _estimate_tokens(msgs)
+                if tok >= 400_000 and now - rotate_log_at.get(tid, 0) > 21600:
+                    print(f"[{ts()}] {title}: ⚠ 컨텍스트 {tok:,} 추정 — rotate 후보. 권장: 세션 교체", flush=True)
+                    rotate_log_at[tid] = now
                 if now - cooldown.get(tid, 0) < IDLE_COOLDOWN:
                     continue
+                # (브레인 켜져 있으면 여기서 decide()로 continue 여부 판단 — 옵트인)
                 r = fb.send(tid, CONTINUE_TEXT)
                 if r.get("ok"):
                     cooldown[tid] = now
@@ -427,7 +575,10 @@ def main():
         return cmd_digest(fb, int(rest[0]) if rest and rest[0].isdigit() else 12)
     if cmd == "stats":
         return cmd_stats(fb)
-    if cmd == "watch":
+    if cmd == "brain":
+        return cmd_brain(fb, rest)
+    if cmd == "decide" and len(rest) >= 3:
+        return cmd_decide_test(fb, rest[0], rest[1], rest[2])
         return cmd_watch(fb, int(rest[0]) if rest and rest[0].isdigit() else DEFAULT_INTERVAL)
     print(__doc__)
     return 1
