@@ -94,6 +94,13 @@ hive는 `.orch/` 디렉토리가 있는 프로젝트에서 강력해진다:
 
 워커 탭을 한 번 부트시켜두면(`.orch/CONTRACT.md 읽고 따르라`) 이후 전부 hive가 중개한다.
 
+## 문서
+
+- [OPENJEV-REVIEW.md](OPENJEV-REVIEW.md) — 공식 Jev API 없이 로컬 결정 엔진(SemIf/JEV-CPU)을 쓸 수 있는지 검수한 보고서
+- [JEV-PROPOSAL.md](JEV-PROPOSAL.md) — hive를 의사결정 오케스트레이터로 진화시키는 v2 설계
+- [PROPOSAL.md](PROPOSAL.md) — 토큰·시간 절감 기술 리서치
+- [RESEARCH.md](RESEARCH.md) — 리서치 근거 + 구현 로드맵
+
 ## 작동 원리 (기술 노트)
 
 - `ps aux` → 오케스트레이터 프로세스 발견 (`orchestrator.js`)
