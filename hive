@@ -86,9 +86,9 @@ def find_orchestrator():
 
 
 class FB:
-    def __init__(self):
+    def __init__(self, allow_missing=False):
         self.port, self.launch_id = find_orchestrator()
-        if not self.port:
+        if not self.port and not allow_missing:
             sys.exit("오류: Freebuff 앱이 실행 중이 아님 (오케스트레이터 미발견)")
 
     def req(self, method, path, body=None):
@@ -320,11 +320,26 @@ def cmd_stats(fb):
 # ---------------------------------------------------------------- watch (통합 루프)
 
 def cmd_watch(fb, interval):
-    print(f"watch 시작 (interval={interval}s). Ctrl+C 로 중단.", flush=True)
+    print(f"watch 시작 (interval={interval}s). Freebuff 앱 대기 중에도 유지.", flush=True)
     cooldown = {}
     inbox_ping_cooldown = {}
+    app_wait = False
     while True:
         try:
+            if fb.port is None:
+                # 앱 꺼짐 상태 — 10초마다 재발견 시도 (앱 켜지면 자동 작동)
+                if not app_wait:
+                    print(f"[{ts()}] Freebuff 미실행 — 앱 켜질 때까지 대기...", flush=True)
+                    app_wait = True
+                time.sleep(10)
+                try:
+                    fb2 = FB()
+                    fb.port, fb.launch_id = fb2.port, fb2.launch_id
+                    print(f"[{ts()}] Freebuff 감지됨 (port={fb.port}) — 감시 재개", flush=True)
+                    app_wait = False
+                except SystemExit:
+                    continue
+                continue
             for t in fb.open_threads():
                 tid = t["id"]
                 title = t.get("title", "")
@@ -360,15 +375,17 @@ def cmd_watch(fb, interval):
                 else:
                     print(f"[{ts()}] {title}: ✗ {r.get('error')}", flush=True)
         except SystemExit:
-            print("앱 종료 감지. 10초 후 재접속 시도...", flush=True)
-            time.sleep(10)
-            try:
-                fb2 = FB()
-                fb.port, fb.launch_id = fb2.port, fb2.launch_id
-            except SystemExit:
-                pass
+            print("앱 종료 감지. 앱 켜질 때까지 대기 모드...", flush=True)
+            fb.port, fb.launch_id = None, None
+            app_wait = True
         except Exception as e:
-            print(f"감시 오류: {e}", flush=True)
+            err = str(e)
+            if "getaddrinfo" in err or "Connection refused" in err or "URLError" in err or "connection" in err.lower():
+                print(f"[{ts()}] 앱 연결 끊김 — 대기 모드 전환", flush=True)
+                fb.port, fb.launch_id = None, None
+                app_wait = True
+            else:
+                print(f"감시 오류: {e}", flush=True)
         time.sleep(interval)
 
 
