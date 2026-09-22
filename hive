@@ -20,6 +20,7 @@ launchId는 오케스트레이터 프로세스 환경변수(FREEBUFF_LAUNCH_ID)�
   hive dispatch "지시문..."          .orch/inbox 작성 + 워커 탭 전송 (자동 배분)
   hive rotate "<탭>"                 긴 탭 → 요약 심은 새 탭 → 구탭 close (컨텍스트 리셋)
   hive meter                         탭별 시간제 소비 상태
+  hive sweep [분] [--dry]            오래 놀고 있는 탭 자동 정리 (기본 30분)
   hive markers                       학습된 오류 마커 목록
   hive digest [N시간]                최근 N시간 활동 요약 (기본 12)
   hive stats                         탭별 토큰 추정·턴 수 통계
@@ -537,6 +538,73 @@ def cmd_decide_test(fb, state, question, opts):
 # ---------------------------------------------------------------- rotate (컨텍스트 갱신)
 
 
+# ---------------------------------------------------------------- sweep (안 쓰는 탭 정리)
+
+SWEEP_IDLE_MIN = int(os.environ.get("HIVE_SWEEP_IDLE_MIN", "30"))     # 30분 이상 idle
+SWEEP_KEEP = ("대가리", "HEAD")                                        # 보호 대상 탭 접두
+SWEEP_LOG = os.path.expanduser("~/.hive/sweep-log.json")
+
+
+def _protect(title):
+    return is_head(title) or title in ("논술공방 확인과 과제",) or title.endswith("(rotate)")
+
+
+def cmd_sweep(fb, idle_min=None, dry=False):
+    """오래 놀고 있는 열린 탭을 조사해 close(아카이브). 창이 많으면 UI가 느려지므로 정리.
+    보호: HEAD, 현재 rotate된 탭, 사용자 지정. 기본 idle 30분.
+    복구: closed 탭은 UI에서 다시 열 수 있음(archive → 재개 가능)."""
+    idle_min = idle_min or SWEEP_IDLE_MIN
+    now_ms = time.time() * 1000
+    swept = []
+    kept = []
+    for t in fb.open_threads():
+        title = t.get("title", "")
+        if _protect(title):
+            kept.append((title, "보호 대상"))
+            continue
+        d = fb.thread_detail(t["id"]).get("thread", {})
+        state = d.get("turnState")
+        outcome = d.get("lastTurnOutcome")
+        fin = d.get("lastTurnFinishedAt")
+        idle = max(0.0, (now_ms - fin) / 60000.0) if fin else 999.0
+        if state == "running":
+            kept.append((title, "실행 중"))
+            continue
+        if idle < idle_min:
+            kept.append((title, f"idle {idle:.0f}분 < {idle_min}분"))
+            continue
+        # 미완료(outcome != completed)면 close하지 않고 보고만 — 데이터 손실 방지
+        if outcome not in ("completed", None):
+            kept.append((title, f"미완료(outcome={outcome}) — close 보류"))
+            continue
+        if dry:
+            swept.append((title, t["id"], "dry-run"))
+            continue
+        r = fb.req("POST", f"/api/thread/{t['id']}/close", {})
+        if r.get("ok"):
+            swept.append((title, t["id"], f"idle {idle:.0f}분"))
+        else:
+            kept.append((title, f"close 실패: {r.get('error')}"))
+    print(f"══ hive sweep — idle {idle_min}분+ 탭 정리{'(dry-run)' if dry else ''} ══")
+    for title, why in kept:
+        print(f"  유지: {title[:28]:28} {why}")
+    for title, tid, why in swept:
+        print(f"  닫음: {title[:28]:28} {why}")
+    if swept and not dry:
+        log = []
+        try:
+            with open(SWEEP_LOG, encoding="utf-8") as f:
+                log = json.load(f)
+        except Exception:
+            pass
+        log.append({"at": now_iso(), "closed": [t[0] for t in swept]})
+        os.makedirs(os.path.dirname(SWEEP_LOG), exist_ok=True)
+        with open(SWEEP_LOG, "w", encoding="utf-8") as f:
+            json.dump(log[-30:], f, ensure_ascii=False, indent=1)
+    print(f"\n결과: 닫음 {len(swept)}개 / 유지 {len(kept)}개. 닫힌 탭은 앱에서 재열 수 있음.")
+    return 0
+
+
 def cmd_rotate(fb, title_or_id):
     """긴 탭 → 마지막 어시스턴트 텍스트로 상태 요약 심은 새 탭 생성 → 구탭 close.
     TokenPilot 근거: 컨텍스트 리셋이 장기 세션 비용의 최대 절감점 (61~87%)."""
@@ -626,6 +694,8 @@ def cmd_watch(fb, interval):
     stuck_note = {}      # 마지막 어시스턴트 텍스트 → 반복 감지
     stuck_log_at = {}    # 스킵 로그 스팸 방지
     rotate_log_at = {}   # rotate 제안 로그 스팸 방지 (6시간)
+    sweep_every = 1800   # 30분마다 한 번씩 안 쓰는 탭 정리
+    last_sweep = 0.0
     app_wait = False
     while True:
         try:
@@ -643,6 +713,13 @@ def cmd_watch(fb, interval):
                 except SystemExit:
                     continue
                 continue
+            # 0) 주기적 탭 정리 (창 과다로 인한 UI 느려짐 방지)
+            if time.time() - last_sweep > sweep_every:
+                try:
+                    n = cmd_sweep(fb, None, False)
+                    last_sweep = time.time()
+                except Exception as e:
+                    print(f"[{ts()}] sweep 오류: {e}", flush=True)
             for t in fb.open_threads():
                 tid = t["id"]
                 title = t.get("title", "")
@@ -691,10 +768,10 @@ def cmd_watch(fb, interval):
                         print(f"[{ts()}] {title}: ◇ 반복 정체 감지 — 스킵 (동일 응답 2회 연속)", flush=True)
                         stuck_log_at[tid] = now
                     continue
-                # rotate 후보 감지: 컨텍스트 적체 (결정만 기록, 실행은 v0.5 rotate)
+                # rotate 후보 감지: 컨텍스트 적체 (결정만 기록, 실행은 rotate)
                 tok, _turns = _estimate_tokens(msgs)
                 if tok >= 400_000 and now - rotate_log_at.get(tid, 0) > 21600:
-                    print(f"[{ts()}] {title}: ⚠ 컨텍스트 {tok:,} 추정 — rotate 후보. 권장: 세션 교체", flush=True)
+                    print(f"[{ts()}] {title}: ⚠ 컨텍스트 {tok:,} 추정 — rotate 후보. 권장: hive rotate '{title}'", flush=True)
                     rotate_log_at[tid] = now
                 # 워커가 아닌 탭(사용자 작업 탭)은 긴 쿨다운 — 실수로 시간제 태우는 것 방지
                 eff_cooldown = IDLE_COOLDOWN if is_worker(title) else 1800
@@ -753,6 +830,10 @@ def main():
         return cmd_meter(fb)
     if cmd == "rotate" and rest:
         return cmd_rotate(fb, rest[0])
+    if cmd == "sweep":
+        dry = "--dry" in rest
+        mins = next((int(x) for x in rest if x.isdigit()), None)
+        return cmd_sweep(fb, mins, dry)
     if cmd == "markers":
         return cmd_markers(fb)
     if cmd == "brain":
