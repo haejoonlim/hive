@@ -482,6 +482,36 @@ def cmd_decide_test(fb, state, question, opts):
     return 0
 
 
+# ---------------------------------------------------------------- meter (시간제 소비 감시)
+
+def cmd_meter(fb):
+    """탭별 시간제 소비 상태. Freebuff는 모델별 시간제(Freebucks/hour)이며,
+    idle 15분(FREEBUFF_DESKTOP_IDLE_RELEASE_MS=900000)이면 세션 자동 반납."""
+    now_ms = time.time() * 1000
+    print(f"══ hive meter — 시간제 소비 상태 ({now_iso()}) ══")
+    print(f"{'탭':20} {'모델':22} {'상태':14} {'idle':>7}  판정")
+    burning = 0
+    for t in fb.open_threads():
+        d = fb.thread_detail(t["id"]).get("thread", {})
+        title = d.get("title", "?")[:20]
+        model = (d.get("model") or "-")[:22]
+        state = d.get("turnState") or "?"
+        fin = d.get("lastTurnFinishedAt")
+        idle_min = max(0.0, (now_ms - fin) / 60000.0) if fin else -1
+        if state == "running":
+            verdict, mark = "● 소비 중", "B"
+            burning += 1
+        elif idle_min < 15:
+            verdict, mark = f"◐ 유예 중 (반납까지 {15 - idle_min:.0f}분)", "H"
+        else:
+            verdict, mark = "○ 반납됨 (15분 경과) — 시간 미소비", "-"
+        idle_s = f"{idle_min:.0f}분" if idle_min >= 0 else "-"
+        print(f"{title:20} {model:22} [{mark}] {idle_s:>7}  {verdict}")
+    print(f"\n소비 중: {burning}개 탭.")
+    print("유예 중 탭은 15분 후 자동 반납 — 건드리지 않는 게 이득. 의미 없는 컨티뉴는 반납을 취소하고 시간을 태움.")
+    return 0
+
+
 # ---------------------------------------------------------------- watch (통합 루프)
 
 def cmd_watch(fb, interval):
@@ -539,9 +569,12 @@ def cmd_watch(fb, interval):
                                     print(f"[{ts()}] {title}: ▶ 인박스 확인 전송 (새 지시 감지)", flush=True)
                                     continue
                 # 2) 공통: idle 컨티뉴 — Smart Watch 휴리스틱 (결정론, RAM 0)
+                # 시간제 주의: idle 15분이면 앱이 세션을 반납(FREEBUFF_DESKTOP_IDLE_RELEASE_MS=900000 실측).
+                # 의미 없는 컨티뉴는 반납을 방해해서 시간제를 태운다 — 완료/대기/정체는 깨우지 않는다.
                 a_texts = [msg_text(m).strip() for m in msgs if m.get("role") == "assistant"]
-                if a_texts and a_texts[-1] == "대기":
-                    continue  # 할 일 없다고 명시한 워커 — 새 지시 감지 전까지 깨우지 않음
+                last_a = a_texts[-1] if a_texts else ""
+                if last_a == "대기" or last_a.endswith("완료"):
+                    continue  # 할 일 없음/작업 완료 보고 — 새 지시 감지 전까지 깨우지 않음
                 # 반복 정체(루프) 감지: 직전 두 어시스턴트 텍스트 동일 → 깨우지 않음
                 if len(a_texts) >= 2 and a_texts[-1] == a_texts[-2] and a_texts[-1] not in ("", "대기"):
                     if now - stuck_log_at.get(tid, 0) > 1800:
@@ -553,7 +586,9 @@ def cmd_watch(fb, interval):
                 if tok >= 400_000 and now - rotate_log_at.get(tid, 0) > 21600:
                     print(f"[{ts()}] {title}: ⚠ 컨텍스트 {tok:,} 추정 — rotate 후보. 권장: 세션 교체", flush=True)
                     rotate_log_at[tid] = now
-                if now - cooldown.get(tid, 0) < IDLE_COOLDOWN:
+                # 워커가 아닌 탭(사용자 작업 탭)은 긴 쿨다운 — 실수로 시간제 태우는 것 방지
+                eff_cooldown = IDLE_COOLDOWN if is_worker(title) else 1800
+                if now - cooldown.get(tid, 0) < eff_cooldown:
                     continue
                 # (브레인 켜져 있으면 여기서 decide()로 continue 여부 판단 — 옵트인)
                 r = fb.send(tid, CONTINUE_TEXT)
@@ -604,6 +639,8 @@ def main():
         return cmd_digest(fb, int(rest[0]) if rest and rest[0].isdigit() else 12)
     if cmd == "stats":
         return cmd_stats(fb)
+    if cmd == "meter":
+        return cmd_meter(fb)
     if cmd == "brain":
         return cmd_brain(fb, rest)
     if cmd == "decide" and len(rest) >= 3:
