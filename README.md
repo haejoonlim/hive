@@ -72,13 +72,17 @@ hive dispatch "소울 커먼더 문서 검수 3건: ①GDD_00 ②GDD_05 ③READM
 hive digest 12          # 최근 12시간, 탭별 + .orch/outbox 보고서
 ```
 
-### 4. stats — 소비 추정 (시간제 요금 대응)
+### 4. stats · meter · rotate — 소비 관리 (시간제 요금 대응)
 
 ```bash
-hive stats
+hive stats             # 탭별 토큰 추정 + 5시간 윈도우 사용률
+hive meter             # 탭별 시간제 소비 상태 (● 소비중 / ◐ 유예 / ○ 반납됨)
+hive rotate "워커 3"   # 긴 탭 → 요약 심은 새 탭 생성 → 구탭 close (컨텍스트 리셋)
 ```
 
-탭별 턴 수·토큰 추정치·5시간 윈도우 사용률 표시. 구독 한도가 언제 깨질지 가늠.
+Freebuff는 모델별 **시간제**(Freebucks/hour)이며 idle 15분이면 세션을 자동 반납한다
+(오케스트레이터 소스 실측). `rotate`가 최대 절감점 — 컨텍스트 40만+ 탭은 새 탭으로
+갈아타는 게 이득 (TokenPilot 근거).
 
 ## .orch 파일 큐 (옵션)
 
@@ -118,6 +122,12 @@ hive는 `.orch/` 디렉토리가 있는 프로젝트에서 강력해진다:
 - Freebuff 앱이 켜져 있어야 동작 (오케스트레이터는 앱의 자식 프로세스).
 - 컨티뉴 전송도 세션 크레딧을 소모한다 — 쿨다운을 늘리면(`hive watch 60`) 소모 감소.
 - 개인용 도구로 만들었음. API가 비공개라 언제든 바뀔 수 있다.
+
+### 5. 학습형 오류 마커
+
+세션이 끊기는 오류 패턴은 계속 바뀐다. watch가 `lastTurnOutcome=error`인 탭의
+마지막 메시지를 자동 학습해 `~/.hive/markers.json`에 저장하고, 이후 같은 패턴은
+자동 컨티뉴 대상이 된다. `hive markers`로 목록 확인.
 
 ## 라이선스
 

@@ -18,6 +18,9 @@ launchId는 오케스트레이터 프로세스 환경변수(FREEBUFF_LAUNCH_ID)�
   hive send "<탭>" "<메시지>"        탭에 메시지 전송
   hive show "<탭>" [N]               마지막 N개 메시지 요약
   hive dispatch "지시문..."          .orch/inbox 작성 + 워커 탭 전송 (자동 배분)
+  hive rotate "<탭>"                 긴 탭 → 요약 심은 새 탭 → 구탭 close (컨텍스트 리셋)
+  hive meter                         탭별 시간제 소비 상태
+  hive markers                       학습된 오류 마커 목록
   hive digest [N시간]                최근 N시간 활동 요약 (기본 12)
   hive stats                         탭별 토큰 추정·턴 수 통계
   hive watch [초]                    통합 감시 루프 (기본 20초)
@@ -190,7 +193,56 @@ SESSION_END_MARKERS = (
 
 def is_session_end_marker(text):
     t = (text or "").lower()
-    return any(m in t for m in SESSION_END_MARKERS)
+    if any(m in t for m in SESSION_END_MARKERS):
+        return True
+    # 학습형 마커 — 현장에서 발견해 저장한 패턴도 인정
+    for m in load_markers():
+        if m and m.lower() in t:
+            return True
+    return False
+
+
+MARKERS_FILE = os.path.expanduser("~/.hive/markers.json")
+
+
+def load_markers():
+    try:
+        with open(MARKERS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_markers(markers):
+    os.makedirs(os.path.dirname(MARKERS_FILE), exist_ok=True)
+    with open(MARKERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(markers, f, ensure_ascii=False, indent=1)
+
+
+def learn_marker(text):
+    """미인식 실패 패턴 학습. lastTurnOutcome=error 인 순간의 마지막 메시지 텍스트에서 추출.
+    내장 마커로 이미 커버되면 스킵. 최대 50개."""
+    line = (text or "").strip().splitlines()[0][:60] if (text or "").strip() else ""
+    if not line or is_session_end_marker(line):
+        return False
+    markers = load_markers()
+    key = line.lower()
+    if any(key in m.lower() or m.lower() in key for m in markers):
+        return False
+    markers.append(line)
+    save_markers(markers[-50:])
+    print(f"[{ts()}] ◆ 새 오류 패턴 학습: {line!r}", flush=True)
+    return True
+
+
+def cmd_markers(fb):
+    builtin = len(SESSION_END_MARKERS)
+    learned = load_markers()
+    print(f"내장 마커 {builtin}개 + 학습 마커 {len(learned)}개 (파일: {MARKERS_FILE})")
+    for m in learned:
+        print(f"  · {m}")
+    print("초기화: 파일 삭제")
+    return 0
 
 
 def is_head(title):
@@ -482,6 +534,59 @@ def cmd_decide_test(fb, state, question, opts):
     return 0
 
 
+# ---------------------------------------------------------------- rotate (컨텍스트 갱신)
+
+
+def cmd_rotate(fb, title_or_id):
+    """긴 탭 → 마지막 어시스턴트 텍스트로 상태 요약 심은 새 탭 생성 → 구탭 close.
+    TokenPilot 근거: 컨텍스트 리셋이 장기 세션 비용의 최대 절감점 (61~87%)."""
+    t = fb.find_by_title(title_or_id)
+    if not t:
+        for x in fb.open_threads():
+            if x["id"].startswith(title_or_id):
+                t = x
+                break
+    if not t:
+        print(f"오류: 열린 탭 '{title_or_id}' 없음.")
+        return 1
+    tid, title = t["id"], t.get("title", "?")
+    project = t.get("projectPath") or t.get("projectId")
+    msgs = fb.snapshot(tid)
+    tok, turns = _estimate_tokens(msgs)
+    # 요약 재료: 마지막 어시스턴트 텍스트 + 최근 유저 지시 3개
+    a_texts = [msg_text(m) for m in msgs if m.get("role") == "assistant"]
+    u_texts = [msg_text(m) for m in msgs if m.get("role") == "user"]
+    summary = a_texts[-1] if a_texts else "(요약 재료 없음)"
+    recent = "\n".join(f"- {u}" for u in u_texts[-3:])
+    seed = (
+        f"[rotate] 이전 세션 '{title}' (턴 {turns}개, 컨텍스트 추정 {tok:,})에서 이어받은 탭이다.\n\n"
+        f"## 직전 상태 요약\n{summary[:1200]}\n\n"
+        f"## 최근 지시 흐름\n{recent[:800]}\n\n"
+        "이 요약을 기준으로 작업을 계속하라. 요약에 없는 건 이전 탭(.orch/outbox 또는 git)에서 확인."
+    )
+    # 1) 새 탭 생성
+    r = fb.req("POST", "/api/threads", {"projectPath": project, "title": f"{title} (rotate)"})
+    if "id" not in r:
+        print(f"오류: 새 탭 생성 실패 — {r.get('error')}")
+        return 1
+    new_id = r["id"]
+    print(f"[{ts()}] 새 탭 생성: {new_id[:8]} '{title} (rotate)'")
+    # 2) 요약 심기 (첫 메시지 = 새 세션 컨텍스트)
+    r2 = fb.send(new_id, seed)
+    if not r2.get("ok"):
+        print(f"오류: 요약 심기 실패 — {r2.get('error')}")
+        return 1
+    print(f"[{ts()}] 요약 심기 완료 ({len(seed)}자)")
+    # 3) 구탭 close (세션 반납 → 시간제 회수)
+    r3 = fb.req("POST", f"/api/thread/{tid}/close", {})
+    if not r3.get("ok"):
+        print(f"오류: 구탭 close 실패 — {r3.get('error')}")
+        return 1
+    print(f"[{ts()}] 구탭 close: {tid[:8]} — 세션 반납, 시간제 회수")
+    print(f"완료: '{title}' → '{title} (rotate)'. 컨텍스트 {tok:,} → 0")
+    return 0
+
+
 # ---------------------------------------------------------------- meter (시간제 소비 감시)
 
 def cmd_meter(fb):
@@ -544,15 +649,18 @@ def cmd_watch(fb, interval):
                 # HEAD 탭(사람-지휘자 대화)은 자동 깨우기 금지 — 무의미한 토큰 소모 방지
                 if is_head(title):
                     continue
-                state = turn_state(fb, tid)
+                detail = fb.thread_detail(tid).get("thread", {})
+                state = detail.get("turnState")
+                failed = detail.get("lastTurnOutcome") == "error"
                 if state == "running":
                     cooldown.pop(tid, None)
                     continue
                 msgs = fb.snapshot(tid)
                 if last_is_user(msgs):
-                    # 마지막이 사용자 메시지여도 세션 종료·공급자 오류 마커면 끊긴 상태 → 컨티뉴 대상
-                    if not is_session_end_marker(msg_text(msgs[-1])):
+                    # 마지막이 사용자 메시지여도 세션 종료·공급자 오류(또는 학습된 마커)면 컨티뉴 대상
+                    if not failed and not is_session_end_marker(msg_text(msgs[-1])):
                         continue
+                    learn_marker(msg_text(msgs[-1]))
                 now = time.time()
                 # 1) 워커 + .orch/inbox 에 새 지시 있으면 인박스 확인 전송
                 if is_worker(title):
@@ -573,7 +681,9 @@ def cmd_watch(fb, interval):
                 # 의미 없는 컨티뉴는 반납을 방해해서 시간제를 태운다 — 완료/대기/정체는 깨우지 않는다.
                 a_texts = [msg_text(m).strip() for m in msgs if m.get("role") == "assistant"]
                 last_a = a_texts[-1] if a_texts else ""
-                if last_a == "대기" or last_a.endswith("완료"):
+                if failed:
+                    pass  # lastTurnOutcome=error — 아래 컨티뉴로 즉시 복구 (대기·완료 스킵 미적용)
+                elif last_a == "대기" or last_a.endswith("완료"):
                     continue  # 할 일 없음/작업 완료 보고 — 새 지시 감지 전까지 깨우지 않음
                 # 반복 정체(루프) 감지: 직전 두 어시스턴트 텍스트 동일 → 깨우지 않음
                 if len(a_texts) >= 2 and a_texts[-1] == a_texts[-2] and a_texts[-1] not in ("", "대기"):
@@ -641,6 +751,10 @@ def main():
         return cmd_stats(fb)
     if cmd == "meter":
         return cmd_meter(fb)
+    if cmd == "rotate" and rest:
+        return cmd_rotate(fb, rest[0])
+    if cmd == "markers":
+        return cmd_markers(fb)
     if cmd == "brain":
         return cmd_brain(fb, rest)
     if cmd == "decide" and len(rest) >= 3:
