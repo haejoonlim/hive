@@ -166,6 +166,23 @@ def last_is_user(msgs):
     return bool(msgs) and msgs[-1].get("role") == "user"
 
 
+# 세션 종료·공급자 오류 마커 — 전송 기록에 사용자 메시지로 박히지만 실제 유저 입력이 아님.
+# 이게 마지막 메시지면 "큐 대기"가 아니라 "끊긴 상태"이므로 컨티뉴 대상이 된다.
+SESSION_END_MARKERS = (
+    "your session ended",
+    "free session ended",
+    "free session ran out",
+    "session ended before this request started",
+    "upstream provider error",
+    "continue the interrupted request",
+)
+
+
+def is_session_end_marker(text):
+    t = (text or "").lower()
+    return any(m in t for m in SESSION_END_MARKERS)
+
+
 def is_head(title):
     return any(title == h or title.startswith(h) for h in HEAD_TITLES)
 
@@ -493,7 +510,9 @@ def cmd_watch(fb, interval):
                     continue
                 msgs = fb.snapshot(tid)
                 if last_is_user(msgs):
-                    continue
+                    # 마지막이 사용자 메시지여도 세션 종료·공급자 오류 마커면 끊긴 상태 → 컨티뉴 대상
+                    if not is_session_end_marker(msg_text(msgs[-1])):
+                        continue
                 now = time.time()
                 # 1) 워커 + .orch/inbox 에 새 지시 있으면 인박스 확인 전송
                 if is_worker(title):
