@@ -175,6 +175,16 @@ SESSION_END_MARKERS = (
     "session ended before this request started",
     "upstream provider error",
     "continue the interrupted request",
+    "agent run error",
+    "failed after",
+    "attempts. last error",
+    "internal server error",
+    "api call error",
+    "rate limit",
+    "overloaded",
+    "network error",
+    "timeout while",
+    "request failed",
 )
 
 
