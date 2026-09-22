@@ -579,6 +579,7 @@ def main():
         return cmd_brain(fb, rest)
     if cmd == "decide" and len(rest) >= 3:
         return cmd_decide_test(fb, rest[0], rest[1], rest[2])
+    if cmd == "watch":
         return cmd_watch(fb, int(rest[0]) if rest and rest[0].isdigit() else DEFAULT_INTERVAL)
     print(__doc__)
     return 1
