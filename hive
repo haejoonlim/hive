@@ -34,6 +34,8 @@ launchId는 오케스트레이터 프로세스 환경변수(FREEBUFF_LAUNCH_ID)�
   hive watch 30
 """
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -719,6 +721,41 @@ def cmd_approve(fb, prefix):
     return 0
 
 
+def _outbox_summary(worker_num, max_chars=500):
+    """워커 outbox 꼬리부를 검수 요약으로 추출 (없으면 빈 문자열)."""
+    path = os.path.join(orch_dir(), "outbox", f"W{worker_num}.md")
+    try:
+        content = open(path, encoding="utf-8").read().strip()
+    except OSError:
+        return ""
+    if not content:
+        return ""
+    tail = content[-max_chars:]
+    return ("…" + tail) if len(content) > max_chars else tail
+
+
+def _report_completion(fb, title, tid, last_a, now, done_reported, cooldown_s=300):
+    """워커 '…완료' 보고 감지 → outbox 내용을 근거로 HEAD 탭에 검수 요약 전송.
+    완료 보고로 처리했으면 True (watch 루프에서 continue 용). 쿨다운 5분."""
+    if not last_a.endswith("완료"):
+        return False
+    if not is_worker(title):
+        return True  # 워커 아닌 탭의 완료성 응답 — 기존 규칙대로 깨우지 않음
+    if now - done_reported.get(tid, 0) <= cooldown_s:
+        return True
+    done_reported[tid] = now
+    num = re.search(r"(\d+)", title)
+    wnum = num.group(1) if num else "?"
+    summ = _outbox_summary(wnum)
+    head = next((x for x in fb.open_threads() if is_head(x.get("title", ""))), None)
+    if head and summ:
+        fb.send(head["id"], (
+            f"📋 {title} 완료 보고 — outbox 검수 요약:\n{summ}\n"
+            f"(전문: .orch/outbox/W{wnum}.md)"))
+        print(f"[{ts()}] {title}: 완료 감지 → HEAD 검수 요약 전송", flush=True)
+    return True
+
+
 def cmd_rotate(fb, title_or_id):
     """긴 탭 → 마지막 어시스턴트 텍스트로 상태 요약 심은 새 탭 생성 → 구탭 close.
     TokenPilot 근거: 컨텍스트 리셋이 장기 세션 비용의 최대 절감점 (61~87%)."""
@@ -808,6 +845,7 @@ def cmd_watch(fb, interval):
     stuck_note = {}      # 마지막 어시스턴트 텍스트 → 반복 감지
     stuck_log_at = {}    # 스킵 로그 스팸 방지
     rotate_log_at = {}   # rotate 제안 로그 스팸 방지 (6시간)
+    done_reported = {}   # 워커 완료 보고 → HEAD 전송 쿨다운 (5분)
     sweep_every = 1800   # 30분마다 한 번씩 안 쓰는 탭 정리
     last_sweep = 0.0
     burn_log_at = 0.0    # 시간제 경고 로그 스팸 방지
@@ -847,8 +885,23 @@ def cmd_watch(fb, interval):
             for t in fb.open_threads():
                 tid = t["id"]
                 title = t.get("title", "")
-                # HEAD 탭(사람-지휘자 대화)은 자동 깨우기 금지 — 무의미한 토큰 소모 방지
+                # HEAD 탭(사람-지휘자 대화) — 자동 깨우기 금지, 대신 hive 명령 청취
                 if is_head(title):
+                    detail_h = fb.thread_detail(tid).get("thread", {})
+                    if detail_h.get("turnState") != "running":
+                        hm = fb.snapshot(tid)
+                        if last_is_user(hm):
+                            text = msg_text(hm[-1]).strip()
+                            low = text.lower()
+                            buf = io.StringIO()
+                            if low.startswith("hive pending"):
+                                with contextlib.redirect_stdout(buf):
+                                    cmd_pending(fb)
+                                fb.send(tid, buf.getvalue().strip() or "대기 요청 없음.")
+                            elif low.startswith("hive approve "):
+                                with contextlib.redirect_stdout(buf):
+                                    cmd_approve(fb, text.split(" ", 2)[2].strip())
+                                fb.send(tid, buf.getvalue().strip() or "처리 완료.")
                     continue
                 detail = fb.thread_detail(tid).get("thread", {})
                 state = detail.get("turnState")
@@ -884,8 +937,10 @@ def cmd_watch(fb, interval):
                 last_a = a_texts[-1] if a_texts else ""
                 if failed:
                     pass  # lastTurnOutcome=error — 아래 컨티뉴로 즉시 복구 (대기·완료 스킵 미적용)
-                elif last_a == "대기" or last_a.endswith("완료"):
-                    continue  # 할 일 없음/작업 완료 보고 — 새 지시 감지 전까지 깨우지 않음
+                elif last_a == "대기":
+                    continue  # 할 일 없음 — 새 지시 감지 전까지 깨우지 않음
+                elif _report_completion(fb, title, tid, last_a, now, done_reported):
+                    continue  # 완료 보고 → HEAD 검수 요약 전송 후 대기
                 # 반복 정체(루프) 감지: 직전 두 어시스턴트 텍스트 동일 → 깨우지 않음
                 if len(a_texts) >= 2 and a_texts[-1] == a_texts[-2] and a_texts[-1] not in ("", "대기"):
                     if now - stuck_log_at.get(tid, 0) > 1800:
