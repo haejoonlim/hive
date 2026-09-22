@@ -21,6 +21,8 @@ launchId는 오케스트레이터 프로세스 환경변수(FREEBUFF_LAUNCH_ID)�
   hive rotate "<탭>"                 긴 탭 → 요약 심은 새 탭 → 구탭 close (컨텍스트 리셋)
   hive meter                         탭별 시간제 소비 상태
   hive sweep [분] [--dry]            오래 놀고 있는 탭 자동 정리 (기본 30분)
+  hive approve <탭id접두>            rotate 승인 (HEAD가 watch 요청에 응답)
+  hive pending                       rotate 승인 대기 목록
   hive markers                       학습된 오류 마커 목록
   hive digest [N시간]                최근 N시간 활동 요약 (기본 12)
   hive stats                         탭별 토큰 추정·턴 수 통계
@@ -298,6 +300,58 @@ def cmd_show(fb, title, n=6):
 
 # ---------------------------------------------------------------- dispatch
 
+def _extract_paths(text):
+    """임무문에서 파일/경로 후보 추출 (절대·상대 경로 + 확장자 있는 토큰)."""
+    paths = set()
+    # 절대/상대 경로 패턴
+    for m in re.findall(r"(?:[\w.-]+/)+[\w.-]+", text):
+        paths.add(m.strip(".,;:)"))
+    # 확장자 토큰 (예: GDD_00.md, GameRoot.cs)
+    for m in re.findall(r"\b[\w가-힣.-]+\.(?:md|cs|py|json|txt|onnx|asset|unity|plist|sh|js|ts)\b", text):
+        paths.add(m)
+    return sorted(paths)
+
+
+def _ownership_conflicts(fb, mission_text):
+    """같은 파일이 두 워커에게 배정될 충돌 검사.
+    ① 새 임무문 내부 경로 vs 각 워커 inbox 기존 지시 경로
+    ② 워커 간 동일 경로
+    반환: [(경로, 관련 워커들)]"""
+    od = orch_dir()
+    inbox = os.path.join(od, "inbox")
+    new_paths = set(_extract_paths(mission_text))
+    conflicts = []
+    owner_map = {}  # path -> [worker]
+    for w in fb.open_threads():
+        if not is_worker(w.get("title", "")):
+            continue
+        num = re.search(r"(\d+)", w.get("title", ""))
+        wname = f"W{num.group(1)}" if num else w.get("title", "?")
+        f = os.path.join(inbox, f"{wname}.md")
+        try:
+            content = open(f, encoding="utf-8").read()
+        except OSError:
+            continue
+        for p in _extract_paths(content):
+            owner_map.setdefault(p, []).append(wname)
+    # ① 새 임무문 경로가 이미 다른 워커 인박스에 있으면
+    for p in new_paths:
+        if p in owner_map and len(owner_map[p]) >= 1:
+            conflicts.append((p, sorted(set(owner_map[p]))))
+    # ② 인박스끼리 이중 배분
+    for p, owners in owner_map.items():
+        if len(set(owners)) > 1:
+            conflicts.append((p, sorted(set(owners))))
+    # 중복 제거
+    seen, uniq = set(), []
+    for p, owners in conflicts:
+        key = (p, tuple(owners))
+        if key not in seen:
+            seen.add(key)
+            uniq.append((p, owners))
+    return uniq
+
+
 def cmd_dispatch(fb, mission_text):
     """임무문을 받아 .orch/inbox 에 기록 후 워커 탭에 전송."""
     od = orch_dir()
@@ -309,6 +363,15 @@ def cmd_dispatch(fb, mission_text):
     workers = [t for t in fb.open_threads() if is_worker(t.get("title", ""))]
     if not workers:
         print("오류: 워커 탭('워커'로 시작하는 제목)이 없다. 탭을 먼저 띄워라.")
+        return 1
+
+    # v0.4: 소유권 충돌 검증 — 같은 파일을 두 워커에 주지 않는다
+    conflicts = _ownership_conflicts(fb, mission_text)
+    if conflicts:
+        print("⚠ 소유권 충돌 감지 — 아래 경로가 이미 다른 워커 인박스에 있음:")
+        for p, owners in conflicts:
+            print(f"  · {p}  ← {', '.join(owners)}")
+        print("충돌 경로를 제외하고 재시도하거나, 기존 인박스를 정리한 뒤 배분해라. 전송 중단함.")
         return 1
 
     # 각 워커 inbox 에 임무 기록 (기존 내용 append)
@@ -401,6 +464,7 @@ def cmd_stats(fb):
 
 # ---------------------------------------------------------------- brain (로컬 결정 엔진 — 옵트인)
 
+BURN_LIMIT = int(os.environ.get("HIVE_BURN_LIMIT", "3"))   # 동시 소비 탭 상한
 BRAIN_PORT = int(os.environ.get("HIVE_BRAIN_PORT", "8777"))
 BRAIN_PID_FILE = os.path.expanduser("~/.hive-brain.pid")
 BRAIN_MODEL_PATH = os.path.expanduser("~/hive-models/MiniCPM5-2B-Q4_K_M.gguf")
@@ -535,7 +599,18 @@ def cmd_decide_test(fb, state, question, opts):
     return 0
 
 
-# ---------------------------------------------------------------- rotate (컨텍스트 갱신)
+# ---------------------------------------------------------------- rotate (컨텍스트 갱신 + watch 자동 트리거)
+
+ROTATE_THRESHOLD = 400_000          # 추정 토큰 이상이면 rotate 후보
+ROTATE_APPROVAL_FILE = os.path.join(orch_dir(), "rotate-approve.txt") if False else None  # (런타임 결정)
+
+
+def _rotate_pending_file():
+    return os.path.join(orch_dir(), "rotate-pending.txt")
+
+
+def _rotate_approved_file():
+    return os.path.join(orch_dir(), "rotate-approve.txt")
 
 
 # ---------------------------------------------------------------- sweep (안 쓰는 탭 정리)
@@ -602,6 +677,45 @@ def cmd_sweep(fb, idle_min=None, dry=False):
         with open(SWEEP_LOG, "w", encoding="utf-8") as f:
             json.dump(log[-30:], f, ensure_ascii=False, indent=1)
     print(f"\n결과: 닫음 {len(swept)}개 / 유지 {len(kept)}개. 닫힌 탭은 앱에서 재열 수 있음.")
+    return 0
+
+
+def cmd_pending(fb):
+    """HEAD 승인 대기 중인 rotate 요청 목록."""
+    try:
+        with open(_rotate_pending_file(), encoding="utf-8") as f:
+            lines = [l.rstrip() for l in f if l.strip()]
+    except OSError:
+        lines = []
+    if not lines:
+        print("승인 대기 rotate 요청 없음.")
+        return 0
+    print("승인 대기 rotate 요청:")
+    for l in lines:
+        print(f"  {l}  → 승인: hive approve {l.split()[0][:8]}")
+    return 0
+
+
+def cmd_approve(fb, prefix):
+    """HEAD가 승인한 rotate 후보를 승인 파일에 기록 → watch가 다음 사이클에 실행."""
+    try:
+        with open(_rotate_pending_file(), encoding="utf-8") as f:
+            lines = [l for l in f if l.strip()]
+    except OSError:
+        print("대기 중인 rotate 요청 없음.")
+        return 0
+    hit = [l for l in lines if l.startswith(prefix)]
+    if not hit:
+        print(f"'{prefix}' 대기 요청 없음. 대기 목록:")
+        for l in lines:
+            print("  " + l.rstrip())
+        return 1
+    with open(_rotate_approved_file(), "a", encoding="utf-8") as f:
+        f.write(hit[0].split()[0] + "\n")
+    remaining = [l for l in lines if not l.startswith(prefix)]
+    with open(_rotate_pending_file(), "w", encoding="utf-8") as f:
+        f.writelines(remaining)
+    print(f"승인 기록: {hit[0].strip()} — watch 다음 사이클에 실행됨")
     return 0
 
 
@@ -696,6 +810,7 @@ def cmd_watch(fb, interval):
     rotate_log_at = {}   # rotate 제안 로그 스팸 방지 (6시간)
     sweep_every = 1800   # 30분마다 한 번씩 안 쓰는 탭 정리
     last_sweep = 0.0
+    burn_log_at = 0.0    # 시간제 경고 로그 스팸 방지
     app_wait = False
     while True:
         try:
@@ -720,6 +835,15 @@ def cmd_watch(fb, interval):
                     last_sweep = time.time()
                 except Exception as e:
                     print(f"[{ts()}] sweep 오류: {e}", flush=True)
+            # 0-1) 시간제 가드: 소비 중 탭 과다 경고
+            burning = 0
+            for t2 in fb.open_threads():
+                d2 = fb.thread_detail(t2["id"]).get("thread", {})
+                if d2.get("turnState") == "running":
+                    burning += 1
+            if burning > BURN_LIMIT and time.time() - burn_log_at > 1800:
+                print(f"[{ts()}] ⚠ 시간제 경고: 소비 중 탭 {burning}개 (상한 {BURN_LIMIT}). idle 탭은 15분 후 자동 반납 — 억지 컨티뉴 금지", flush=True)
+                burn_log_at = time.time()
             for t in fb.open_threads():
                 tid = t["id"]
                 title = t.get("title", "")
@@ -768,11 +892,35 @@ def cmd_watch(fb, interval):
                         print(f"[{ts()}] {title}: ◇ 반복 정체 감지 — 스킵 (동일 응답 2회 연속)", flush=True)
                         stuck_log_at[tid] = now
                     continue
-                # rotate 후보 감지: 컨텍스트 적체 (결정만 기록, 실행은 rotate)
+                # rotate 후보 감지: 40만+ → HEAD 승인 요청 1회 → 승인되면 자동 rotate
                 tok, _turns = _estimate_tokens(msgs)
-                if tok >= 400_000 and now - rotate_log_at.get(tid, 0) > 21600:
-                    print(f"[{ts()}] {title}: ⚠ 컨텍스트 {tok:,} 추정 — rotate 후보. 권장: hive rotate '{title}'", flush=True)
-                    rotate_log_at[tid] = now
+                if tok >= ROTATE_THRESHOLD:
+                    pending_f, approve_f = _rotate_pending_file(), _rotate_approved_file()
+                    approved = False
+                    try:
+                        with open(approve_f, encoding="utf-8") as f:
+                            approved = tid in f.read()
+                    except OSError:
+                        pass
+                    if approved:
+                        print(f"[{ts()}] {title}: ↻ 승인 확인 — 자동 rotate 시작 (컨텍스트 {tok:,})", flush=True)
+                        try:
+                            os.remove(approve_f)
+                        except OSError:
+                            pass
+                        cmd_rotate(fb, tid)
+                        rotate_log_at[tid] = now
+                        continue
+                    if now - rotate_log_at.get(tid, 0) > 21600:
+                        with open(_rotate_pending_file(), "a", encoding="utf-8") as f:
+                            f.write(f"{tid} {title} {tok:,}\n")
+                        head = next((x for x in fb.open_threads() if is_head(x.get("title", ""))), None)
+                        if head:
+                            fb.send(head["id"], (
+                                f"⏳ rotate 승인 요청: '{title}' 컨텍스트 {tok:,} 추정 (임계 {ROTATE_THRESHOLD:,}).\n"
+                                f"승인하려면: hive approve {tid[:8]}  — 거부/무시 시 6시간 후 재요청."))
+                        print(f"[{ts()}] {title}: ⚠ 컨텍스트 {tok:,} — HEAD 승인 요청 전송", flush=True)
+                        rotate_log_at[tid] = now
                 # 워커가 아닌 탭(사용자 작업 탭)은 긴 쿨다운 — 실수로 시간제 태우는 것 방지
                 eff_cooldown = IDLE_COOLDOWN if is_worker(title) else 1800
                 if now - cooldown.get(tid, 0) < eff_cooldown:
@@ -834,6 +982,10 @@ def main():
         dry = "--dry" in rest
         mins = next((int(x) for x in rest if x.isdigit()), None)
         return cmd_sweep(fb, mins, dry)
+    if cmd == "approve" and rest:
+        return cmd_approve(fb, rest[0])
+    if cmd == "pending":
+        return cmd_pending(fb)
     if cmd == "markers":
         return cmd_markers(fb)
     if cmd == "brain":
